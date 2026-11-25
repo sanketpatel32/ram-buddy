@@ -9,9 +9,12 @@ use std::os::windows::io::{FromRawHandle, OwnedHandle};
 use std::ptr::null_mut;
 
 use windows_sys::Win32::{
-    Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM},
+    Foundation::{
+        ERROR_ALREADY_EXISTS, ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM,
+    },
     System::{
         LibraryLoader::GetModuleHandleW,
+        Registry::{HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD, RegGetValueW, RegSetKeyValueW},
         SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX},
         Threading::CreateMutexW,
     },
@@ -19,7 +22,7 @@ use windows_sys::Win32::{
 };
 use windows_sys::w;
 
-use processes::{MIB, MIN_MIB};
+use processes::{MIB, Scope};
 use sprite::Mood;
 
 const TRAY_EVENT: u32 = WM_APP + 1;
@@ -27,12 +30,46 @@ const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 const TIMER: usize = 1;
 const CLEAN: u32 = 1;
 const QUIT: u32 = 2;
+const CLEAN_NODE: u32 = 3;
+const CLEAN_PYTHON: u32 = 4;
+const THRESHOLDS: [u32; 4] = [128, 256, 512, 1024];
+const DEFAULT_THRESHOLD: u32 = 256;
+const SETTINGS_KEY: *const u16 = w!("Software\\RAM Buddy");
+const THRESHOLD_VALUE: *const u16 = w!("CleanupThresholdMiB");
+
+fn saved_threshold() -> u32 {
+    let mut threshold = 0u32;
+    let mut size = size_of::<u32>() as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            SETTINGS_KEY,
+            THRESHOLD_VALUE,
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            std::ptr::from_mut(&mut threshold).cast(),
+            &mut size,
+        )
+    };
+    if status == ERROR_SUCCESS && THRESHOLDS.contains(&threshold) {
+        threshold
+    } else {
+        DEFAULT_THRESHOLD
+    }
+}
+
+fn gib_parts(bytes: u64) -> (u64, u64) {
+    const GIB: u64 = 1024 * MIB as u64;
+    let tenths = bytes / GIB * 10 + (bytes % GIB * 10 + GIB / 2) / GIB;
+    (tenths / 10, tenths % 10)
+}
 
 struct Tray {
     icons: [[HICON; 2]; 4],
     taskbar_created: u32,
     tick: Cell<u32>,
-    load: Cell<Option<u32>>,
+    memory: Cell<Option<MEMORYSTATUSEX>>,
+    threshold: Cell<u32>,
     busy: Cell<bool>,
 }
 
@@ -43,7 +80,8 @@ impl Tray {
                 .map(|mood| [mood.create_icon(false), mood.create_icon(true)]),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             tick: Cell::new(0),
-            load: Cell::new(None),
+            memory: Cell::new(None),
+            threshold: Cell::new(saved_threshold()),
             busy: Cell::new(false),
         }
     }
@@ -55,20 +93,30 @@ impl Tray {
                 ..Default::default()
             };
             let success = unsafe { GlobalMemoryStatusEx(&mut memory) } != 0;
-            self.load.set(success.then_some(memory.dwMemoryLoad));
+            self.memory.set(success.then_some(memory));
         }
-        let load = self.load.get();
-        let mood = Mood::from_load(load);
+        let memory = self.memory.get();
+        let mood = Mood::from_load(memory.map(|memory| memory.dwMemoryLoad));
         let mut data = tray_data(hwnd);
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         data.uCallbackMessage = TRAY_EVENT;
         data.hIcon = self.icons[mood as usize][(self.tick.get() % 2) as usize];
-        let tip = match load {
-            Some(load) => format!(
-                "RAM Buddy · {load}% RAM · {}\nClick to review heavy Node/Python tasks",
-                mood.label()
+        let tip = match memory {
+            Some(memory) => {
+                let (used, used_decimal) =
+                    gib_parts(memory.ullTotalPhys.saturating_sub(memory.ullAvailPhys));
+                let (total, total_decimal) = gib_parts(memory.ullTotalPhys);
+                format!(
+                    "RAM Buddy · {}% · {used}.{used_decimal}/{total}.{total_decimal} GiB · {}\nClick to review processes ≥ {} MiB",
+                    memory.dwMemoryLoad,
+                    mood.label(),
+                    self.threshold.get()
+                )
+            }
+            None => format!(
+                "RAM Buddy · RAM unavailable\nClick to review processes ≥ {} MiB",
+                self.threshold.get()
             ),
-            None => "RAM Buddy · RAM unavailable\nClick to review heavy Node/Python tasks".into(),
         };
         for (output, character) in data.szTip.iter_mut().zip(tip.encode_utf16()) {
             *output = character;
@@ -78,6 +126,27 @@ impl Tray {
                 data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
                 Shell_NotifyIconW(NIM_SETVERSION, &data);
             }
+        }
+    }
+
+    fn set_threshold(&self, hwnd: HWND, threshold: u32) {
+        self.threshold.set(threshold);
+        let status = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                SETTINGS_KEY,
+                THRESHOLD_VALUE,
+                REG_DWORD,
+                std::ptr::from_ref(&threshold).cast(),
+                size_of::<u32>() as u32,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            dialog(
+                hwnd,
+                "Windows could not save the setting. The new threshold applies until RAM Buddy exits.",
+                MB_ICONWARNING,
+            );
         }
     }
 }
@@ -116,8 +185,9 @@ fn dialog(hwnd: HWND, message: &str, flags: MESSAGEBOX_STYLE) -> MESSAGEBOX_RESU
     }
 }
 
-fn cleanup(hwnd: HWND) {
-    let targets = match processes::scan() {
+fn cleanup(hwnd: HWND, scope: Scope, threshold: u32) {
+    let runtime = scope.label();
+    let targets = match processes::scan(scope, threshold) {
         Ok(targets) => targets,
         Err(error) => {
             dialog(
@@ -131,9 +201,7 @@ fn cleanup(hwnd: HWND) {
     if targets.is_empty() {
         dialog(
             hwnd,
-            &format!(
-                "No stoppable Node or Python processes are using {MIN_MIB} MiB of RAM or more."
-            ),
+            &format!("No stoppable {runtime} processes are using {threshold} MiB of RAM or more."),
             MB_ICONINFORMATION,
         );
         return;
@@ -141,7 +209,7 @@ fn cleanup(hwnd: HWND) {
 
     let count = targets.len();
     let mut summary = format!(
-        "Force-stop {count} heavy Node/Python process(es)?\nUnsaved work in these processes may be lost.\n\n"
+        "Force-stop {count} matching {runtime} process(es)?\nEach is using at least {threshold} MiB of RAM. Unsaved work may be lost.\n\n"
     );
     for process in targets.iter().take(10) {
         use std::fmt::Write;
@@ -172,7 +240,7 @@ fn cleanup(hwnd: HWND) {
     dialog(hwnd, &result, MB_ICONINFORMATION);
 }
 
-fn menu(hwnd: HWND) -> u32 {
+fn menu(hwnd: HWND, threshold: u32) -> u32 {
     unsafe {
         let menu = CreatePopupMenu();
         if menu.is_null() {
@@ -182,8 +250,42 @@ fn menu(hwnd: HWND) -> u32 {
             menu,
             MF_STRING,
             CLEAN as usize,
-            w!("Review heavy processes…"),
+            w!("Review Node.js and Python…"),
         );
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            CLEAN_NODE as usize,
+            w!("Review Node.js only…"),
+        );
+        AppendMenuW(
+            menu,
+            MF_STRING,
+            CLEAN_PYTHON as usize,
+            w!("Review Python only…"),
+        );
+        let thresholds = CreatePopupMenu();
+        if !thresholds.is_null() {
+            for value in THRESHOLDS {
+                let label: Vec<u16> = format!("{value} MiB").encode_utf16().chain([0]).collect();
+                let flags = MF_STRING
+                    | if value == threshold {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    };
+                AppendMenuW(thresholds, flags, value as usize, label.as_ptr());
+            }
+            if AppendMenuW(
+                menu,
+                MF_POPUP,
+                thresholds as usize,
+                w!("Minimum RAM per process"),
+            ) == 0
+            {
+                DestroyMenu(thresholds);
+            }
+        }
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(menu, MF_STRING, QUIT as usize, w!("Exit RAM Buddy"));
         let mut point = POINT::default();
@@ -229,13 +331,22 @@ unsafe extern "system" fn window_proc(
                         return 0;
                     }
                     let command = if event == WM_CONTEXTMENU {
-                        menu(hwnd)
+                        menu(hwnd, tray.threshold.get())
                     } else {
                         CLEAN
                     };
-                    if command == CLEAN {
-                        cleanup(hwnd);
+                    let scope = match command {
+                        CLEAN => Some(Scope::All),
+                        CLEAN_NODE => Some(Scope::Node),
+                        CLEAN_PYTHON => Some(Scope::Python),
+                        _ => None,
+                    };
+                    if let Some(scope) = scope {
+                        cleanup(hwnd, scope, tray.threshold.get());
                         tray.refresh(hwnd, true);
+                    } else if THRESHOLDS.contains(&command) {
+                        tray.set_threshold(hwnd, command);
+                        tray.refresh(hwnd, false);
                     }
                     tray.busy.set(false);
                     if command == QUIT {

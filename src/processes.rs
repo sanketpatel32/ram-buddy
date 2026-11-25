@@ -20,7 +20,33 @@ use windows_sys::Win32::{
 };
 
 pub const MIB: usize = 1024 * 1024;
-pub const MIN_MIB: usize = 256;
+
+#[derive(Clone, Copy)]
+pub enum Scope {
+    All,
+    Node,
+    Python,
+}
+
+impl Scope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "Node.js or Python",
+            Self::Node => "Node.js",
+            Self::Python => "Python",
+        }
+    }
+
+    fn matches(self, name: &str) -> bool {
+        let is_node = name.eq_ignore_ascii_case("node.exe");
+        runtime_name(name)
+            && match self {
+                Self::All => true,
+                Self::Node => is_node,
+                Self::Python => !is_node,
+            }
+    }
+}
 
 pub struct Target {
     handle: OwnedHandle,
@@ -83,7 +109,7 @@ fn user_sid(process: HANDLE, buffer: &mut UserBuffer) -> io::Result<PSID> {
     }
 }
 
-fn target(pid: u32, own_session: u32, own_sid: PSID) -> Option<Target> {
+fn target(pid: u32, own_session: u32, own_sid: PSID, scope: Scope, min_mib: u32) -> Option<Target> {
     unsafe {
         let handle = OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE,
@@ -112,7 +138,7 @@ fn target(pid: u32, own_session: u32, own_sid: PSID) -> Option<Target> {
         }
         let path = String::from_utf16_lossy(&path[..length as usize]);
         let name = path.rsplit('\\').next()?;
-        if !runtime_name(name) {
+        if !scope.matches(name) {
             return None;
         }
         let mut memory = PROCESS_MEMORY_COUNTERS::default();
@@ -121,7 +147,7 @@ fn target(pid: u32, own_session: u32, own_sid: PSID) -> Option<Target> {
             &mut memory,
             size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
         ) == 0
-            || memory.WorkingSetSize < MIN_MIB * MIB
+            || memory.WorkingSetSize < min_mib as usize * MIB
         {
             return None;
         }
@@ -134,7 +160,7 @@ fn target(pid: u32, own_session: u32, own_sid: PSID) -> Option<Target> {
     }
 }
 
-pub fn scan() -> io::Result<Vec<Target>> {
+pub fn scan(scope: Scope, min_mib: u32) -> io::Result<Vec<Target>> {
     let mut targets = Vec::new();
     let mut own_session = 0;
     let mut buffer = [0; 32];
@@ -161,8 +187,9 @@ pub fn scan() -> io::Result<Vec<Target>> {
                 .iter()
                 .position(|&ch| ch == 0)
                 .unwrap_or(entry.szExeFile.len());
-            if runtime_name(&String::from_utf16_lossy(&entry.szExeFile[..length]))
-                && let Some(process) = target(entry.th32ProcessID, own_session, own_sid)
+            if scope.matches(&String::from_utf16_lossy(&entry.szExeFile[..length]))
+                && let Some(process) =
+                    target(entry.th32ProcessID, own_session, own_sid, scope, min_mib)
             {
                 targets.push(process);
             }
@@ -241,7 +268,7 @@ mod tests {
         let mut light = spawn(&dir, "python.exe", "2");
         let until = Instant::now() + Duration::from_secs(5);
         let target = loop {
-            let targets = scan().unwrap();
+            let targets = scan(Scope::All, 256).unwrap();
             assert!(!targets.iter().any(|target| target.pid == light.child.id()));
             if let Some(target) = targets
                 .into_iter()
@@ -252,6 +279,15 @@ mod tests {
             assert!(Instant::now() < until, "heavy fixture never appeared");
             std::thread::sleep(Duration::from_millis(40));
         };
+        let has_heavy = |scope, threshold| {
+            scan(scope, threshold)
+                .unwrap()
+                .iter()
+                .any(|target| target.pid == heavy.child.id())
+        };
+        assert!(has_heavy(Scope::Node, 256));
+        assert!(!has_heavy(Scope::Python, 256));
+        assert!(!has_heavy(Scope::Node, 512));
         assert!(target.stop());
         assert!(light.child.try_wait().unwrap().is_none());
         drop(target);

@@ -6,7 +6,7 @@ RAM Buddy is a small Windows tray app that shows how much physical RAM is in use
 
 1. Download [RAM Buddy for Windows x64](https://github.com/sanketpatel32/ram-buddy/releases/latest/download/ram-buddy-windows-x64.zip) from GitHub and extract the ZIP.
 2. Run `ram-buddy.exe`. The app is portable and runs as a regular Windows user. The executable is unsigned.
-3. Look for the buddy beside the clock or under the **^** arrow for hidden icons. Hover over it to see the current RAM percentage.
+3. Look for the buddy beside the clock or under the **^** arrow for hidden icons. Hover to see the RAM percentage, used and total GiB, and the cleanup threshold.
 
 Each [GitHub release](https://github.com/sanketpatel32/ram-buddy/releases) includes a SHA-256 checksum for the ZIP. To verify your download, run `Get-FileHash .\ram-buddy-windows-x64.zip -Algorithm SHA256` in PowerShell and compare the hash with `SHA256SUMS.txt`.
 
@@ -18,8 +18,8 @@ Each [GitHub release](https://github.com/sanketpatel32/ram-buddy/releases) inclu
 | 70–84% | Amber buddy strains and sweats |
 | 85% or higher | Pink buddy panics |
 
-- **Click the icon** to preview the Node.js and Python processes in your account and Windows session that are using at least **256 MiB of resident RAM each**. Choose **Yes** to force-stop the selected group or **No** to cancel. Force-stopping a process can discard its unsaved work.
-- **Right-click the icon** to review processes or exit RAM Buddy.
+- **Click the icon** to preview qualifying Node.js and Python processes in your account and Windows session. Choose **Yes** to force-stop the matching group or **No** to cancel. Force-stopping a process can discard its unsaved work.
+- **Right-click the icon** to review Node.js or Python separately, change the minimum RAM per process, or exit. The threshold defaults to **256 MiB of resident RAM** and can be set to **128, 256, 512, or 1024 MiB**. RAM Buddy remembers your choice when restarted.
 
 The app reads total RAM use periodically and scans processes when you open the cleanup preview. It runs locally and sends no telemetry.
 
