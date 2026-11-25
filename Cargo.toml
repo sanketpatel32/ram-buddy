@@ -2,6 +2,9 @@
 name = "ram-buddy"
 version = "0.1.0"
 edition = "2024"
+description = "A lightweight Windows tray app for monitoring RAM and stopping heavy Node.js and Python processes"
+license = "MIT"
+repository = "https://github.com/sanketpatel32/ram-buddy"
 
 [dependencies]
 windows-sys = { version = "0.61", features = [
